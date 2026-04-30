@@ -15,9 +15,9 @@
 #include <functional>
 #include <fstream>
 #include <climits>
+#include <atomic>
 
 static const int DIMS = 16;   // demo vectors
-// Doc embeddings dimension is determined at runtime from Ollama's model output
 
 // =====================================================================
 //  DATA TYPES
@@ -38,13 +38,15 @@ using DistFn = std::function<float(const std::vector<float>&, const std::vector<
 
 float euclidean(const std::vector<float>& a, const std::vector<float>& b) {
     float s = 0;
-    for (int i = 0; i < (int)a.size(); i++) { float d = a[i]-b[i]; s += d*d; }
+    size_t n = std::min(a.size(), b.size());
+    for (size_t i = 0; i < n; i++) { float d = a[i]-b[i]; s += d*d; }
     return std::sqrt(s);
 }
 
 float cosine(const std::vector<float>& a, const std::vector<float>& b) {
     float dot=0, na=0, nb=0;
-    for (int i = 0; i < (int)a.size(); i++) {
+    size_t n = std::min(a.size(), b.size());
+    for (size_t i = 0; i < n; i++) {
         dot += a[i]*b[i]; na += a[i]*a[i]; nb += b[i]*b[i];
     }
     if (na < 1e-9f || nb < 1e-9f) return 1.0f;
@@ -53,7 +55,8 @@ float cosine(const std::vector<float>& a, const std::vector<float>& b) {
 
 float manhattan(const std::vector<float>& a, const std::vector<float>& b) {
     float s = 0;
-    for (int i = 0; i < (int)a.size(); i++) s += std::abs(a[i]-b[i]);
+    size_t n = std::min(a.size(), b.size());
+    for (size_t i = 0; i < n; i++) s += std::abs(a[i]-b[i]);
     return s;
 }
 
@@ -79,7 +82,7 @@ public:
         std::vector<std::pair<float,int>> r;
         r.reserve(items.size());
         for (auto& v : items) r.push_back({dist(q, v.emb), v.id});
-        std::sort(r.begin(), r.end());
+        std::partial_sort(r.begin(), r.begin() + std::min(k, (int)r.size()), r.end());
         if ((int)r.size() > k) r.resize(k);
         return r;
     }
@@ -135,6 +138,21 @@ class KDTree {
             knn(farther, q, k, d+1, dist, heap);
     }
 
+    // Build a balanced KD-tree from sorted items
+    KDNode* buildBalanced(std::vector<VectorItem>& items, int lo, int hi, int depth) {
+        if (lo > hi) return nullptr;
+        int ax = depth % dims;
+        int mid = (lo + hi) / 2;
+        std::nth_element(items.begin() + lo, items.begin() + mid, items.begin() + hi + 1,
+            [ax](const VectorItem& a, const VectorItem& b) {
+                return a.emb[ax] < b.emb[ax];
+            });
+        KDNode* node = new KDNode(items[mid]);
+        node->left  = buildBalanced(items, lo, mid - 1, depth + 1);
+        node->right = buildBalanced(items, mid + 1, hi, depth + 1);
+        return node;
+    }
+
 public:
     explicit KDTree(int d) : dims(d) {}
     ~KDTree() { destroy(root); }
@@ -154,7 +172,10 @@ public:
 
     void rebuild(const std::vector<VectorItem>& items) {
         destroy(root); root = nullptr;
-        for (auto& v : items) insert(v);
+        if (items.empty()) return;
+        // Build a balanced tree instead of sequential insertion
+        std::vector<VectorItem> sorted = items;
+        root = buildBalanced(sorted, 0, (int)sorted.size() - 1, 0);
     }
 };
 
@@ -178,7 +199,8 @@ class HNSW {
 
     int randLevel() {
         std::uniform_real_distribution<float> u(0.0f, 1.0f);
-        return (int)std::floor(-std::log(u(rng)) * mL);
+        int lvl = (int)std::floor(-std::log(u(rng)) * mL);
+        return std::min(lvl, 6);  // Cap maximum layer to prevent degenerate graphs
     }
 
     std::vector<std::pair<float,int>> searchLayer(
@@ -189,6 +211,8 @@ class HNSW {
             std::vector<std::pair<float,int>>, std::greater<>> cands;
         std::priority_queue<std::pair<float,int>> found;
 
+        if (!G.count(ep)) return {};
+
         float d0 = dist(q, G[ep].item.emb);
         vis[ep] = true;
         cands.push({d0, ep});
@@ -197,9 +221,10 @@ class HNSW {
         while (!cands.empty()) {
             auto [cd, cid] = cands.top(); cands.pop();
             if ((int)found.size() >= ef && cd > found.top().first) break;
+            if (!G.count(cid)) continue;
             if (lyr >= (int)G[cid].nbrs.size()) continue;
             for (int nid : G[cid].nbrs[lyr]) {
-                if (vis[nid] || !G.count(nid)) continue;
+                if (vis.count(nid) || !G.count(nid)) continue;
                 vis[nid] = true;
                 float nd = dist(q, G[nid].item.emb);
                 if ((int)found.size() < ef || nd < found.top().first) {
@@ -237,7 +262,7 @@ public:
 
         int ep = entryPt;
         for (int lc = topLayer; lc > lvl; lc--) {
-            if (lc < (int)G[ep].nbrs.size()) {
+            if (G.count(ep) && lc < (int)G[ep].nbrs.size()) {
                 auto W = searchLayer(item.emb, ep, 1, lc, dist);
                 if (!W.empty()) ep = W[0].second;
             }
@@ -271,10 +296,10 @@ public:
     std::vector<std::pair<float,int>> knn(
         const std::vector<float>& q, int k, int ef, DistFn dist)
     {
-        if (entryPt == -1) return {};
+        if (entryPt == -1 || !G.count(entryPt)) return {};
         int ep = entryPt;
         for (int lc = topLayer; lc > 0; lc--) {
-            if (lc < (int)G[ep].nbrs.size()) {
+            if (G.count(ep) && lc < (int)G[ep].nbrs.size()) {
                 auto W = searchLayer(q, ep, 1, lc, dist);
                 if (!W.empty()) ep = W[0].second;
             }
@@ -286,14 +311,26 @@ public:
 
     void remove(int id) {
         if (!G.count(id)) return;
-        for (auto& [nid, nd] : G)
+        // Clean up references from all neighbors
+        for (auto& [nid, nd] : G) {
+            if (nid == id) continue;
             for (auto& layer : nd.nbrs)
                 layer.erase(std::remove(layer.begin(), layer.end(), id), layer.end());
-        if (entryPt == id) {
-            entryPt = -1;
-            for (auto& [nid, nd] : G) if (nid != id) { entryPt = nid; break; }
         }
+        bool wasEntry = (entryPt == id);
         G.erase(id);
+
+        if (wasEntry) {
+            entryPt = -1;
+            topLayer = -1;
+            // Find new entry point with highest layer
+            for (auto& [nid, nd] : G) {
+                if (nd.maxLyr > topLayer) {
+                    topLayer = nd.maxLyr;
+                    entryPt = nid;
+                }
+            }
+        }
     }
 
     struct GraphInfo {
@@ -440,7 +477,13 @@ std::string jS(const std::string& s) {
         else if (c == '\n') o += "\\n";
         else if (c == '\r') o += "\\r";
         else if (c == '\t') o += "\\t";
-        else                o += c;
+        else if ((unsigned char)c < 0x20) {
+            // Escape other control characters as \u00XX
+            char buf[8];
+            snprintf(buf, sizeof(buf), "\\u%04x", (unsigned char)c);
+            o += buf;
+        }
+        else o += c;
     }
     return o + '"';
 }
@@ -462,12 +505,11 @@ std::vector<float> parseVec(const std::string& s) {
     return v;
 }
 
-// Extract a JSON string field value (handles basic escape sequences)
 std::string extractStr(const std::string& body, const std::string& key) {
     size_t p = body.find('"' + key + '"');
     if (p == std::string::npos) return "";
     p = body.find(':', p) + 1;
-    while (p < body.size() && (body[p] == ' ' || body[p] == '\t')) p++;
+    while (p < body.size() && (body[p] == ' ' || body[p] == '\t' || body[p] == '\n' || body[p] == '\r')) p++;
     if (p >= body.size() || body[p] != '"') return "";
     p++;
     std::string result;
@@ -481,6 +523,7 @@ std::string extractStr(const std::string& body, const std::string& key) {
                 case 'n':  result += '\n'; break;
                 case 'r':  result += '\r'; break;
                 case 't':  result += '\t'; break;
+                case '/':  result += '/';  break;
                 default:   result += body[p]; break;
             }
         } else {
@@ -491,12 +534,11 @@ std::string extractStr(const std::string& body, const std::string& key) {
     return result;
 }
 
-// Extract a JSON integer field value
 int extractInt(const std::string& body, const std::string& key, int def = 0) {
     size_t p = body.find('"' + key + '"');
     if (p == std::string::npos) return def;
     p = body.find(':', p) + 1;
-    while (p < body.size() && (body[p] == ' ' || body[p] == '\t')) p++;
+    while (p < body.size() && (body[p] == ' ' || body[p] == '\t' || body[p] == '\n' || body[p] == '\r')) p++;
     try { return std::stoi(body.substr(p)); } catch (...) { return def; }
 }
 
@@ -540,7 +582,7 @@ std::vector<std::string> chunkText(const std::string& text,
     if ((int)words.size() <= chunkWords) return {text};
 
     std::vector<std::string> chunks;
-    int step = chunkWords - overlapWords;
+    int step = std::max(1, chunkWords - overlapWords);
     for (int i = 0; i < (int)words.size(); i += step) {
         int end = std::min(i + chunkWords, (int)words.size());
         std::string chunk;
@@ -552,37 +594,37 @@ std::vector<std::string> chunkText(const std::string& text,
 }
 
 // =====================================================================
-//  OLLAMA CLIENT  — wraps local Ollama REST API
-//  Install:  https://ollama.com
-//  Models:   ollama pull nomic-embed-text
-//            ollama pull llama3.2
+//  OLLAMA CLIENT
 // =====================================================================
 
 class OllamaClient {
     std::string host;
     int         port;
 
-    // Escape a string for embedding inside a JSON string literal
     std::string esc(const std::string& s) {
         std::string o;
+        o.reserve(s.size() + 16);
         for (char c : s) {
             if      (c == '"')  o += "\\\"";
             else if (c == '\\') o += "\\\\";
             else if (c == '\n') o += "\\n";
             else if (c == '\r') o += "\\r";
             else if (c == '\t') o += "\\t";
-            else                o += c;
+            else if ((unsigned char)c < 0x20) {
+                char buf[8];
+                snprintf(buf, sizeof(buf), "\\u%04x", (unsigned char)c);
+                o += buf;
+            }
+            else o += c;
         }
         return o;
     }
 
-    // Parse {"embedding":[...]} from Ollama /api/embeddings response
     std::vector<float> parseEmbedding(const std::string& body) {
         size_t p = body.find("\"embedding\"");
         if (p == std::string::npos) return {};
         p = body.find('[', p);
         if (p == std::string::npos) return {};
-        // Find matching ]  — embeddings can be large (768+ floats)
         size_t e = p + 1, depth = 1;
         while (e < body.size() && depth > 0) {
             if (body[e] == '[') depth++;
@@ -592,7 +634,6 @@ class OllamaClient {
         return parseVec(body.substr(p + 1, e - p - 2));
     }
 
-    // Parse {"response":"..."} from Ollama /api/generate response
     std::string parseResponse(const std::string& body) {
         return extractStr(body, "response");
     }
@@ -605,40 +646,47 @@ public:
         : host(h), port(p) {}
 
     bool isAvailable() {
-        httplib::Client cli(host, port);
-        cli.set_connection_timeout(2, 0);
-        auto res = cli.Get("/api/tags");
-        return res && res->status == 200;
+        try {
+            httplib::Client cli(host, port);
+            cli.set_connection_timeout(2, 0);
+            cli.set_read_timeout(3, 0);
+            auto res = cli.Get("/api/tags");
+            return res && res->status == 200;
+        } catch (...) { return false; }
     }
 
-    // Returns empty vector if Ollama is not running or model not found
     std::vector<float> embed(const std::string& text) {
-        httplib::Client cli(host, port);
-        cli.set_connection_timeout(3, 0);
-        cli.set_read_timeout(30, 0);
-        std::string body = "{\"model\":\"" + embedModel + "\",\"prompt\":\"" + esc(text) + "\"}";
-        auto res = cli.Post("/api/embeddings", body, "application/json");
-        if (!res || res->status != 200) return {};
-        return parseEmbedding(res->body);
+        try {
+            httplib::Client cli(host, port);
+            cli.set_connection_timeout(3, 0);
+            cli.set_read_timeout(30, 0);
+            std::string body = "{\"model\":\"" + embedModel + "\",\"prompt\":\"" + esc(text) + "\"}";
+            auto res = cli.Post("/api/embeddings", body, "application/json");
+            if (!res || res->status != 200) return {};
+            return parseEmbedding(res->body);
+        } catch (...) { return {}; }
     }
 
-    // Returns error string if Ollama is unavailable
     std::string generate(const std::string& prompt) {
-        httplib::Client cli(host, port);
-        cli.set_connection_timeout(3, 0);
-        cli.set_read_timeout(180, 0);   // LLMs can be slow
-        std::string body = "{\"model\":\"" + genModel + "\","
-                           "\"prompt\":\"" + esc(prompt) + "\","
-                           "\"stream\":false}";
-        auto res = cli.Post("/api/generate", body, "application/json");
-        if (!res || res->status != 200)
-            return "ERROR: Ollama unavailable. Run: ollama serve";
-        return parseResponse(res->body);
+        try {
+            httplib::Client cli(host, port);
+            cli.set_connection_timeout(3, 0);
+            cli.set_read_timeout(180, 0);
+            std::string body = "{\"model\":\"" + genModel + "\","
+                               "\"prompt\":\"" + esc(prompt) + "\","
+                               "\"stream\":false}";
+            auto res = cli.Post("/api/generate", body, "application/json");
+            if (!res || res->status != 200)
+                return "ERROR: Ollama unavailable. Run: ollama serve";
+            return parseResponse(res->body);
+        } catch (...) {
+            return "ERROR: Ollama connection failed.";
+        }
     }
 };
 
 // =====================================================================
-//  DOCUMENT DATABASE  — HNSW over real Ollama embeddings
+//  DOCUMENT DATABASE
 // =====================================================================
 
 struct DocItem {
@@ -651,15 +699,14 @@ struct DocItem {
 class DocumentDB {
     std::unordered_map<int, DocItem> store;
     HNSW       hnsw;
-    BruteForce bf;       // brute force fallback for small sets
+    BruteForce bf;
     std::mutex mu;
     int nextId = 1;
-    int dims   = 0;      // determined from first inserted embedding
+    int dims   = 0;
 
 public:
     DocumentDB() : hnsw(16, 200) {}
 
-    // Insert one chunk with its pre-computed embedding
     int insert(const std::string& title, const std::string& text,
                const std::vector<float>& emb)
     {
@@ -673,7 +720,6 @@ public:
         return item.id;
     }
 
-    // Semantic search — returns top-k most similar chunks
     std::vector<std::pair<float, DocItem>> search(
         const std::vector<float>& q, int k, float max_dist = 0.7f)
     {
@@ -695,6 +741,20 @@ public:
         return true;
     }
 
+    // Remove all chunks whose title starts with a given prefix
+    int removeByTitlePrefix(const std::string& prefix) {
+        std::lock_guard<std::mutex> lk(mu);
+        std::vector<int> toRemove;
+        for (auto& [id, doc] : store) {
+            if (doc.title.substr(0, prefix.size()) == prefix)
+                toRemove.push_back(id);
+        }
+        for (int id : toRemove) {
+            store.erase(id); hnsw.remove(id); bf.remove(id);
+        }
+        return (int)toRemove.size();
+    }
+
     std::vector<DocItem> all() {
         std::lock_guard<std::mutex> lk(mu);
         std::vector<DocItem> r;
@@ -702,21 +762,39 @@ public:
         return r;
     }
 
+    // Get unique document titles (without chunk suffixes)
+    std::vector<std::pair<std::string, std::vector<DocItem>>> grouped() {
+        std::lock_guard<std::mutex> lk(mu);
+        std::unordered_map<std::string, std::vector<DocItem>> groups;
+        for (auto& [id, doc] : store) {
+            // Strip chunk suffix like " [1/3]"
+            std::string base = doc.title;
+            auto bracket = base.rfind(" [");
+            if (bracket != std::string::npos) base = base.substr(0, bracket);
+            groups[base].push_back(doc);
+        }
+        std::vector<std::pair<std::string, std::vector<DocItem>>> result;
+        for (auto& [title, chunks] : groups) result.push_back({title, chunks});
+        return result;
+    }
+
     size_t size() {
         std::lock_guard<std::mutex> lk(mu);
         return store.size();
     }
 
-    int getDims() { return dims; }
+    int getDims() {
+        std::lock_guard<std::mutex> lk(mu);
+        return dims;
+    }
 };
 
 // =====================================================================
-//  DEMO DATA  (16D categorical vectors)
+//  DEMO DATA
 // =====================================================================
 
 void loadDemo(VectorDB& db) {
     auto dist = getDistFn("cosine");
-    // Dims 0-3: CS | Dims 4-7: Math | Dims 8-11: Food | Dims 12-15: Sports
     db.insert("Linked List: nodes connected by pointers", "cs",
         {0.90f,0.85f,0.72f,0.68f,0.12f,0.08f,0.15f,0.10f,0.05f,0.08f,0.06f,0.09f,0.07f,0.11f,0.08f,0.06f}, dist);
     db.insert("Binary Search Tree: O(log n) search and insert", "cs",
@@ -770,16 +848,26 @@ int main() {
 
     loadDemo(db);
 
-    // Check Ollama at startup (non-fatal)
     bool ollamaUp = ollama.isAvailable();
-    std::cout << "=== VectorDB Engine ===" << std::endl;
-    std::cout << "http://localhost:8080" << std::endl;
-    std::cout << db.size() << " demo vectors | " << DIMS << " dims | HNSW+KD-Tree+BruteForce" << std::endl;
-    std::cout << "Ollama: " << (ollamaUp ? "ONLINE" : "OFFLINE (install from ollama.com)") << std::endl;
-    if (ollamaUp) std::cout << "  embed model: " << ollama.embedModel
-                            << "  gen model: "   << ollama.genModel << std::endl;
+
+    std::cout << "\n";
+    std::cout << "  ╔══════════════════════════════════════════╗\n";
+    std::cout << "  ║         MY OWN AI — VectorDB Engine      ║\n";
+    std::cout << "  ╠══════════════════════════════════════════╣\n";
+    std::cout << "  ║  Server:    http://localhost:8080         ║\n";
+    std::cout << "  ║  Vectors:   " << std::setw(3) << db.size() << " demo items (" << DIMS << "D)          ║\n";
+    std::cout << "  ║  Algorithms: HNSW + KD-Tree + BruteForce ║\n";
+    std::cout << "  ║  Ollama:    " << (ollamaUp ? "ONLINE ✓               " : "OFFLINE ✗              ") << "║\n";
+    if (ollamaUp) {
+    std::cout << "  ║    embed:   " << std::left << std::setw(28) << ollama.embedModel << "║\n";
+    std::cout << "  ║    gen:     " << std::left << std::setw(28) << ollama.genModel << "║\n";
+    }
+    std::cout << "  ╚══════════════════════════════════════════╝\n\n";
 
     httplib::Server svr;
+
+    // Allow larger request bodies for document insertion
+    svr.set_payload_max_length(1024 * 1024 * 10); // 10MB
 
     // CORS preflight
     svr.Options(".*", [](const httplib::Request&, httplib::Response& res) {
@@ -796,7 +884,7 @@ int main() {
                             "application/json"); return;
         }
         int k = 5;
-        try { k = std::stoi(req.get_param_value("k")); } catch (...) {}
+        try { k = std::clamp(std::stoi(req.get_param_value("k")), 1, 50); } catch (...) {}
         auto metric = req.get_param_value("metric"); if (metric.empty()) metric = "cosine";
         auto algo   = req.get_param_value("algo");   if (algo.empty())   algo   = "hnsw";
 
@@ -900,8 +988,6 @@ int main() {
 
     // ── DOCUMENT + RAG ENDPOINTS ──────────────────────────────────────
 
-    // POST /doc/insert  {"title":"...","text":"..."}
-    // Chunks the text, embeds each chunk via Ollama, stores in DocumentDB
     svr.Post("/doc/insert", [&](const httplib::Request& req, httplib::Response& res) {
         cors(res);
         auto title = extractStr(req.body, "title");
@@ -937,7 +1023,6 @@ int main() {
         res.set_content(ss.str(), "application/json");
     });
 
-    // DELETE /doc/delete/123
     svr.Delete(R"(/doc/delete/(\d+))", [&](const httplib::Request& req, httplib::Response& res) {
         cors(res);
         int id  = std::stoi(req.matches[1]);
@@ -946,28 +1031,41 @@ int main() {
                         "application/json");
     });
 
-    // GET /doc/list
     svr.Get("/doc/list", [&](const httplib::Request&, httplib::Response& res) {
         cors(res);
         auto docs = docDB.all();
+
+        // Sort by ID for consistent display order
+        std::sort(docs.begin(), docs.end(), [](const DocItem& a, const DocItem& b) {
+            return a.id < b.id;
+        });
+
         std::ostringstream ss; ss << '[';
         for (size_t i = 0; i < docs.size(); i++) {
             if (i) ss << ',';
-            // Truncate text preview to 120 chars
             std::string preview = docs[i].text.substr(0, 120);
-            if (docs[i].text.size() > 120) preview += "…";
+            if (docs[i].text.size() > 120) preview += "...";
+            // Count words properly
+            int wordCount = 0;
+            bool inWord = false;
+            for (char c : docs[i].text) {
+                if (c == ' ' || c == '\n' || c == '\t' || c == '\r') {
+                    inWord = false;
+                } else if (!inWord) {
+                    inWord = true;
+                    wordCount++;
+                }
+            }
             ss << "{\"id\":" << docs[i].id
                << ",\"title\":" << jS(docs[i].title)
                << ",\"preview\":" << jS(preview)
-               << ",\"words\":"  << (int)std::count(docs[i].text.begin(), docs[i].text.end(), ' ') + 1
+               << ",\"words\":"  << wordCount
                << '}';
         }
         ss << ']';
         res.set_content(ss.str(), "application/json");
     });
 
-    // POST /doc/search {"question":"...","k":3}
-    // Fast retrieval for the UI visualizer
     svr.Post("/doc/search", [&](const httplib::Request& req, httplib::Response& res) {
         cors(res);
         auto question = extractStr(req.body, "question");
@@ -995,8 +1093,6 @@ int main() {
         res.set_content(ss.str(), "application/json");
     });
 
-    // POST /doc/ask  {"question":"...","k":3}
-    // Full RAG pipeline: embed → retrieve → generate
     svr.Post("/doc/ask", [&](const httplib::Request& req, httplib::Response& res) {
         cors(res);
         auto question = extractStr(req.body, "question");
@@ -1005,35 +1101,40 @@ int main() {
             res.set_content("{\"error\":\"need question\"}", "application/json"); return;
         }
 
-        // Step 1: embed the question
         auto qEmb = ollama.embed(question);
         if (qEmb.empty()) {
             res.set_content("{\"error\":\"Ollama unavailable\"}", "application/json"); return;
         }
 
-        // Step 2: retrieve top-k relevant chunks
         auto hits = docDB.search(qEmb, k);
 
-        // Step 3: build prompt
         std::ostringstream ctx;
         for (int i = 0; i < (int)hits.size(); i++) {
             ctx << "[" << (i+1) << "] " << hits[i].second.title << ":\n"
                 << hits[i].second.text << "\n\n";
         }
-        std::string prompt =
-            "You are a helpful assistant. Answer the user's question directly. "
-            "Use the provided context if it contains relevant information. "
-            "If it doesn't, just use your own general knowledge. "
-            "IMPORTANT: Do NOT mention the 'context', 'provided text', or say things like 'the context doesn't mention'. "
-            "Just answer the question naturally.\n\n"
-            "Context:\n" + ctx.str() +
-            "Question: " + question + "\n\n"
-            "Answer:";
 
-        // Step 4: generate answer
+        std::string prompt;
+        if (hits.empty()) {
+            // No documents found — just answer from general knowledge
+            prompt = "You are a helpful assistant. Answer the following question "
+                     "using your general knowledge.\n\n"
+                     "Question: " + question + "\n\n"
+                     "Answer:";
+        } else {
+            prompt =
+                "You are a helpful assistant. Answer the user's question directly. "
+                "Use the provided context if it contains relevant information. "
+                "If it doesn't, just use your own general knowledge. "
+                "IMPORTANT: Do NOT mention the 'context', 'provided text', or say things like 'the context doesn't mention'. "
+                "Just answer the question naturally.\n\n"
+                "Context:\n" + ctx.str() +
+                "Question: " + question + "\n\n"
+                "Answer:";
+        }
+
         auto answer = ollama.generate(prompt);
 
-        // Step 5: return everything
         std::ostringstream ss;
         ss << "{\"answer\":" << jS(answer)
            << ",\"model\":"  << jS(ollama.genModel)
@@ -1049,7 +1150,6 @@ int main() {
         res.set_content(ss.str(), "application/json");
     });
 
-    // GET /status
     svr.Get("/status", [&](const httplib::Request&, httplib::Response& res) {
         cors(res);
         bool up = ollama.isAvailable();
@@ -1084,6 +1184,7 @@ int main() {
             "text/html");
     });
 
+    std::cout << "  Listening on http://0.0.0.0:8080 ...\n\n";
     svr.listen("0.0.0.0", 8080);
     return 0;
 }

@@ -16,3 +16,7 @@ bin/
 # OS files
 .DS_Store
 Thumbs.db
+
+db.exe
+*.exe
+*.log
