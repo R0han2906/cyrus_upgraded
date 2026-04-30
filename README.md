@@ -12,8 +12,7 @@
 ![HTML5](https://img.shields.io/badge/HTML5-Canvas-E34F26?style=for-the-badge&logo=html5&logoColor=white)
 ![JavaScript](https://img.shields.io/badge/JavaScript-ES2022-F7DF1E?style=for-the-badge&logo=javascript&logoColor=black)
 ![Ollama](https://img.shields.io/badge/Ollama-Local%20LLM-FFFFFF?style=for-the-badge&logo=ollama&logoColor=black)
-![REST](https://img.shields.io/badge/REST-API-6366F1?style=for-the-badge)
-![MIT](https://img.shields.io/badge/License-MIT-22D3EE?style=for-the-badge)
+
 
 </div>
 
